@@ -1,0 +1,83 @@
+version: '3.8'
+
+x-airflow-env: &airflow-env
+  AIRFLOW_HOME: /opt/airflow
+  AIRFLOW__CORE__EXECUTOR: LocalExecutor
+  AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg2://airflow:airflow@postgres:5432/airflow
+  AIRFLOW__CORE__FERNET_KEY: 'MKEyKzAxM3dzdThJUkFJLzQzSS1yRW9OMXpiOV91Yz0='
+  AIRFLOW__CORE__DAGS_ARE_PAUSED_AT_CREATION: 'false'
+  AIRFLOW__CORE__LOAD_EXAMPLES: 'false'
+  AIRFLOW__WEBSERVER__EXPOSE_CONFIG: 'true'
+  # Airflow 3.0 SimpleAuthManager: define users as "username:role" pairs.
+  # Passwords are managed separately via the generated password file (see webserver command).
+  AIRFLOW__CORE__SIMPLE_AUTH_MANAGER_USERS: 'admin:Admin'
+
+services:
+  postgres:
+    image: postgres:13
+    environment:
+      POSTGRES_USER: airflow
+      POSTGRES_PASSWORD: airflow
+      POSTGRES_DB: airflow
+    volumes:
+      - postgres_db:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U airflow"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # Runs before the webserver: migrates the DB and registers HTTP connections.
+  # Does NOT create the admin user — passwords use file-based auth (see webserver command).
+  airflow-init:
+    image: apache/airflow:3.0.6
+    environment:
+      <<: *airflow-env
+    volumes:
+      - ./logs:/opt/airflow/logs
+    depends_on:
+      postgres:
+        condition: service_healthy
+    command: >
+      bash -c "
+        airflow db migrate &&
+        airflow connections add wttr_in --conn-type http --conn-host wttr.in --conn-schema https 2>/dev/null || true &&
+        airflow connections add open_meteo --conn-type http --conn-host api.open-meteo.com --conn-schema https 2>/dev/null || true
+      "
+    restart: on-failure
+
+  airflow-webserver:
+    image: apache/airflow:3.0.6
+    environment:
+      <<: *airflow-env
+    volumes:
+      - ./dags:/opt/airflow/dags
+      - ./logs:/opt/airflow/logs
+      - ./plugins:/opt/airflow/plugins
+      - ./data:/opt/airflow/data
+      - ./config:/opt/airflow/config
+    ports:
+      - "8080:8080"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      airflow-init:
+        condition: service_completed_successfully
+    # Airflow 3.0 uses file-based auth (SimpleAuthManager). Pre-writing the password
+    # file ensures admin:admin123 always works, even after restarts.
+    command: >
+      bash -c "
+        echo '{\"admin\": \"admin123\"}' > /opt/airflow/simple_auth_manager_passwords.json.generated &&
+        exec airflow standalone
+      "
+    healthcheck:
+      # Airflow 3.0 moved the health endpoint to /api/v2/monitor/health.
+      # /health → "Moved in Airflow 3" redirect, /api/v1/health → removed in Airflow 3.
+      test: ["CMD", "curl", "-f", "http://localhost:8080/api/v2/monitor/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 60s
+
+volumes:
+  postgres_db:
